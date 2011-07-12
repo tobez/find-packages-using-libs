@@ -385,7 +385,7 @@ our @libpath;
 our %libpath;
 
 for my $lp (qw(/lib /usr/lib /usr/local/lib /compat/linux/usr/lib /compat/linux/lib)) {
-	push @libpath, $lp;
+	push @libpath, $lp if -d $lp;
 }
 %libpath = map { $_ => 1 } @libpath;
 
@@ -393,7 +393,7 @@ for (`/sbin/ldconfig -r`) {
 	if (s/^\s+search directories: //) {
 		chomp;
 		for my $lp (split /:/, $_) {
-			next if $libpath{$lp};
+			next if $libpath{$lp} || !-d $lp;
 			push @libpath, $lp;
 			$libpath{$lp} = 1;
 		}

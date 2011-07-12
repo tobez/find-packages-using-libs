@@ -1,0 +1,480 @@
+#! /usr/local/bin/perl -w
+# ----------------------------------------------------------------------------
+# This file is in public domain.
+# Author: Anton Berezin <tobez@freebsd.org>
+# ----------------------------------------------------------------------------
+#
+
+use strict;
+use warnings;
+use 5.0100;
+
+# |/-\
+my $pchar = "|";
+my $do_progress = -t *STDOUT;
+sub progress
+{
+	if ($do_progress) {
+		print STDERR "$pchar";
+		$pchar =~ tr<|/\\-><-|/\\>;
+	}
+}
+
+package FreeBSD::Package;
+use strict;
+use warnings;
+
+use IO::File;
+
+sub new
+{
+	my ($pkg, %p) = @_;
+	my $pkgdir = $p{pkgdir} || return undef;
+	my $name = $pkgdir;
+	$name =~ s|.*/||;
+	main::progress();
+	my $c = IO::File->new("< $pkgdir/+CONTENTS");
+	return undef unless $c;
+	my @lines;
+	while (<$c>) {
+		chomp;
+		push @lines, $_;
+	}
+	my $me = bless {
+		pkgdir => $pkgdir,
+		lines  => \@lines,
+		name   => $name,
+	}, $pkg;
+	return $me;
+}
+
+sub name
+{
+	return $_[0]->{name};
+}
+
+sub lines
+{
+	my $me = shift;
+	if (@_ && @_ == 1 && ref(@_) eq 'ARRAY') {
+		$me->{lines} = [@{$_[0]}];
+		$me->{changed} = 1;
+	} elsif (@_) {
+		$me->{lines} = [@_];
+		$me->{changed} = 1;
+	} else {
+		return @{$me->{lines}};
+	}
+}
+
+package FreeBSD::Package::DB;
+use strict;
+use warnings;
+
+sub new
+{
+	my ($pkg, %p) = @_;
+	my $me = bless {
+		dbdir => $p{dbdir} || $ENV{PKG_DBDIR} || "/var/db/pkg",
+	}, $pkg;
+	$me->{packages} = [ grep { -d } glob "$me->{dbdir}/*" ];
+	$me->reset;
+	return $me;
+}
+
+sub next
+{
+	my ($me) = @_;
+	while (1) {
+		$me->{current}++;
+		if ($me->{current} >= @{$me->{packages}}) {
+			$me->reset;
+			return undef;
+		}
+		my $pkg = FreeBSD::Package->new(pkgdir => $me->{packages}->[$me->{current}]);
+		return $pkg if $pkg;
+	}
+}
+
+sub reset
+{
+	my ($me) = @_;
+	$me->{current} = -1;
+}
+
+package FreeBSD::ELF;
+
+our %elf;
+our $initialized;
+
+sub get_shared_libs_list
+{
+	my ($class, $fn) = @_;
+
+	my $me = bless { fn => $fn }, $class;
+	open $me->{fh}, "<", $fn or die "open($fn): $!";
+
+	$me->init unless $initialized;
+	$me->read_header;
+	$me->read_section_headers;
+	my $e_shstrndx = $me->get_half(ehdr => "e_shstrndx");
+	$me->err("no section names") unless $e_shstrndx;
+	$me->{shstrtab} = $me->read_section($e_shstrndx);
+
+	for my $i (0..$me->{n_sects}-1) {
+		$me->{sechdr} = substr($me->{sechdrs}, $me->{e_shentsize}*$i, $me->{e_shentsize});
+		my $sh_name_ofs = $me->get_word(sechdr => "sh_name");
+		my $name = $me->get_strz(shstrtab => $sh_name_ofs);
+		my $type = $me->get_word(sechdr => "sh_type");
+		if ($type == $elf{SHT_STRTAB} && $name eq ".dynstr") {
+			$me->{dynstr} = $me->read_section($i);
+		} elsif ($type == $elf{SHT_DYNAMIC} && $name eq ".dynamic") {
+			$me->{dynamic} = $me->read_section($i);
+			$me->{dynamic_ent_size} = $me->get_xword(sechdr => "sh_entsize");
+		}
+	}
+	$me->err("no dynamic section") unless $me->{dynamic} && $me->{dynamic_ent_size};
+	$me->err("no dynamic string table") unless $me->{dynstr};
+
+	my (@libs, @rpath);
+	for my $i (0..length($me->{dynamic})/$me->{dynamic_ent_size}) {
+		$me->{dynentry} = substr($me->{dynamic}, $me->{dynamic_ent_size}*$i, $me->{dynamic_ent_size});
+		my $tag = $me->get_xword(dynentry => "d_tag");
+		last if $tag == $elf{DT_NULL};
+		if ($tag == $elf{DT_NEEDED}) {
+			push @libs, $me->get_strz(dynstr => $me->get_addr(dynentry => "d_ptr"));
+		} elsif ($tag == $elf{DT_RPATH}) {
+			push @rpath, split /:/, $me->get_strz(dynstr => $me->get_addr(dynentry => "d_ptr"));
+		} elsif ($tag == $elf{DT_RUNPATH}) {
+			push @rpath, split /:/, $me->get_strz(dynstr => $me->get_addr(dynentry => "d_ptr"));
+		}
+	}
+
+	return { libs => \@libs, rpath => \@rpath };
+}
+
+sub read_section
+{
+	my ($me, $n) = @_;
+	$me->{"sechdr_$n"} = substr($me->{sechdrs}, $me->{e_shentsize}*$n);
+	$me->seek_ofs("sechdr_$n" => "sh_offset");
+	my $sz = $me->get_xword("sechdr_$n" => "sh_size");
+	my $r;
+	sysread($me->{fh}, $r, $sz);
+	return $r;
+}
+
+sub read_section_headers
+{
+	my $me = shift;
+	$me->seek_ofs(ehdr => "e_shoff");
+	$me->{e_shentsize} = $me->get_half(ehdr => "e_shentsize");
+	$me->{n_sects} =  $me->get_half(ehdr => "e_shnum");
+	$me->err("no sections") unless $me->{n_sects};
+	sysread($me->{fh}, $me->{sechdrs}, $me->{e_shentsize}*$me->{n_sects});
+}
+
+sub read_header
+{
+	my $me = shift;
+	my $ehdr;
+	sysread($me->{fh}, $ehdr, $elf{Ehdr64});
+	$me->{ehdr} = $ehdr;
+	$me->err("not an ELF") unless substr($ehdr, 0, 4) eq "\x7fELF";
+	my $c = substr($ehdr, 4, 1);
+	$c = 32 if $c eq "\1";
+	$c = 64 if $c eq "\2";
+	$me->err("unsupported word size") unless $c eq 32 || $c eq 64;
+	$me->{c} = $c;
+	my $lsb = substr($ehdr, 5, 1);
+	$me->err("unsupported byte order") unless $lsb eq "\1" || $lsb eq "\2";
+	$me->{lsb} = $lsb eq "\1" ? 1 : 0;
+}
+
+sub err
+{
+	my $me = shift;
+	die "$me->{fn}: @_";
+}
+
+sub get_strz
+{
+	my ($me, $section, $ofs) = @_;
+	unpack("Z*", substr($me->{$section}, $ofs));
+}
+
+sub get1
+{
+	my ($me, $struct, $field) = @_;
+	unpack("C", substr($me->{$struct}, $elf{$me->{c}}{$field}, 1));
+}
+
+sub get2
+{
+	my ($me, $struct, $field) = @_;
+	unpack($me->{lsb} ? "v" : "n", substr($me->{$struct}, $elf{$me->{c}}{$field}, 2));
+}
+
+sub get4
+{
+	my ($me, $struct, $field) = @_;
+	unpack($me->{lsb} ? "V" : "N", substr($me->{$struct}, $elf{$me->{c}}{$field}, 4));
+}
+
+sub get8
+{
+	my ($me, $struct, $field) = @_;
+	my $q1 = unpack($me->{lsb} ? "V" : "N", substr($me->{$struct}, $elf{$me->{c}}{$field}, 4));
+	my $q2 = unpack($me->{lsb} ? "V" : "N", substr($me->{$struct}, $elf{$me->{c}}{$field}+4, 4));
+	if ($me->{lsb}) {
+		return ($q2 << 32) | $q1;
+	} else {
+		return ($q1 << 32) | $q2;
+	}
+}
+
+sub get_addr
+{
+	my $me = shift;
+	if ($me->{c} == 32) {
+		$me->get4(@_);
+	} else {
+		$me->get8(@_);
+	}
+}
+
+sub get_half
+{
+	my $me = shift;
+	$me->get2(@_);
+}
+
+sub get_off
+{
+	my $me = shift;
+	if ($me->{c} == 32) {
+		$me->get4(@_);
+	} else {
+		$me->get8(@_);
+	}
+}
+
+sub get_xword
+{
+	my $me = shift;
+	if ($me->{c} == 32) {
+		$me->get4(@_);
+	} else {
+		$me->get8(@_);
+	}
+}
+
+sub get_sword
+{
+	my $me = shift;
+	$me->get4(@_);
+}
+
+sub get_word
+{
+	my $me = shift;
+	$me->get4(@_);
+}
+
+sub get_lword
+{
+	my $me = shift;
+	$me->get8(@_);
+}
+
+sub seek_ofs
+{
+	my ($me, $struct, $field) = @_;
+	my $off = $me->get_off($struct, $field);
+	sysseek $me->{fh}, $off, 0;
+}
+
+sub init
+{
+	$initialized = 1;
+	%elf = (
+		Ehdr32 => 52,
+		Ehdr64 => 64,
+		SHT_STRTAB  => 3,
+		SHT_DYNAMIC => 6,
+		DT_NULL => 0,
+		DT_NEEDED => 1,
+		DT_RPATH => 15,
+		DT_RUNPATH => 29,
+		32 => {
+			e_shoff => 32,
+			e_shnum => 48,
+			e_shentsize => 46,
+			sh_name => 0,
+			e_shstrndx => 50,
+			sh_offset    => 16,
+			sh_size      => 20,
+			sh_type      => 4,
+			sh_entsize => 36,
+			d_tag => 0,
+			d_ptr => 4,
+		},
+		64 => {
+			e_shoff => 40,
+			e_shnum => 60,
+			e_shentsize => 58,
+			sh_name => 0,
+			e_shstrndx => 62,
+			sh_offset    => 24,
+			sh_size      => 32,
+			sh_type      => 4,
+			sh_entsize => 56,
+			d_tag => 0,
+			d_ptr => 8,
+		},
+	);
+	return 1;
+}
+
+package main;
+use strict;
+use warnings;
+
+our $broken_only = 0;
+my @check_libs;
+my $quiet;
+our $VERSION = "1.0";
+
+while (@ARGV) {
+	my $opt = shift;
+	if ($opt eq "-b") {
+		$broken_only = 1;
+	} elsif ($opt eq "-q") {
+		$quiet = 1;
+	} elsif ($opt eq "-v") {
+		$_ = $0;
+		s|.*/||;
+		print "$_ version $VERSION\n";
+		exit 0;
+	} elsif ($opt =~ /^-/) {
+		print "Unknown option `$opt'\n";
+		usage();
+	} else {
+		$opt =~ s/\\/\\\\/g;
+		$opt =~ s/\./\\./g;
+		$opt =~ s/\?/./g;
+		$opt =~ s/\*/.*/g;
+		push @check_libs, $opt;
+	}
+}
+if (!@check_libs && !$broken_only) {
+	print "Either -b, or library templates, or both must be specified\n";
+	usage();
+}
+
+sub usage
+{
+	$_ = $0;
+	s|.*/||;
+	print "Usage:\n";
+	print "\t$_ -v\n\t$_ [-q] libs...\n\t$_ -b [-q] [libs...]\n";
+	exit 1;
+}
+
+our @libpath;
+our %libpath;
+
+for my $lp (qw(/lib /usr/lib /usr/local/lib /compat/linux/usr/lib /compat/linux/lib)) {
+	push @libpath, $lp;
+}
+%libpath = map { $_ => 1 } @libpath;
+
+for (`/sbin/ldconfig -r`) {
+	if (s/^\s+search directories: //) {
+		chomp;
+		for my $lp (split /:/, $_) {
+			next if $libpath{$lp};
+			push @libpath, $lp;
+			$libpath{$lp} = 1;
+		}
+		last;
+	}
+}
+
+sub check_package
+{
+	my ($pkg) = @_;
+	my $pkg_name = $pkg->name;
+	my $prefix = "";
+
+	main::progress();
+
+	my $ok = 1;
+	for ($pkg->lines) {
+		if (/^\@cwd\s+(\S+)\s*$/) {
+			$prefix = $1;
+			next;
+		}
+		my $file = "$prefix/$_";
+		next if -l $file;
+		# check shared libs and executables
+		if (-x $file || $file =~ /\.so\b[^\/]*$/) {
+			my $r = eval { FreeBSD::ELF->get_shared_libs_list($file); };
+			if ($r && $r->{libs}) {
+				if ($r->{rpath} && @{$r->{rpath}}) {
+					for my $rpath (@{$r->{rpath}}) {
+						next if $libpath{$rpath};
+						push @libpath, $rpath;
+						$libpath{$rpath} = 1;
+					}
+				}
+				LIB: for my $l (@{$r->{libs}}) {
+					if (@check_libs) {
+						my $match;
+						for my $cl (@check_libs) {
+							next unless $l =~ /^$cl$/;
+							$match = 1;
+							last;
+						}
+						if (!$broken_only) {
+							if ($match) {
+								if ($ok) {
+									print "$pkg_name";
+									print " ($file wants $l)" unless $quiet;
+									print "\n";
+								}
+								$ok = 0;
+							}
+							next LIB;
+						}
+					}
+					if ($l =~ /\//) {
+						next if -f $l;
+						if ($ok) {
+							print "$pkg_name";
+							print " ($file wants $l)" unless $quiet;
+							print "\n";
+						}
+						$ok = 0;
+					} else {
+						for my $lp (@libpath) {
+							next LIB if -f "$lp/$l";
+						}
+						if ($ok) {
+							print "$pkg_name";
+							print " ($file wants $l)" unless $quiet;
+							print "\n";
+						}
+						$ok = 0;
+					}
+				}
+			}
+			main::progress();
+		}
+	}
+}
+
+my $db = FreeBSD::Package::DB->new;
+while (my $pkg = $db->next) {
+	check_package($pkg);
+}

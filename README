@@ -1,0 +1,3 @@
+A diagnostic tool to find FreeBSD packages using
+specific shared libraries, or find packages using
+non-existing libraries.

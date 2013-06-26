@@ -20,7 +20,7 @@ sub progress
 	}
 }
 
-package FreeBSD::Package;
+package FreeBSD::Package::OLD;
 use strict;
 use warnings;
 
@@ -67,7 +67,57 @@ sub lines
 	}
 }
 
-package FreeBSD::Package::DB;
+sub files
+{
+	my $me = shift;
+	my @files;
+	my $prefix = "";
+	for ($me->lines) {
+		if (/^\@cwd\s+(\S+)\s*$/) {
+			$prefix = $1;
+			next;
+		} elsif (/^\@/) {
+			next;
+		}
+		push @files, "$prefix/$_";
+	}
+	@files;
+}
+
+package FreeBSD::Package::PkgNg;
+use strict;
+use warnings;
+
+use DBIx::Perlish;
+
+sub new
+{
+	my ($pkg, %p) = @_;
+	my $dbh = $p{dbh};
+	my $me = bless {
+		name  => "$p{package}{name}-$p{package}{version}",
+		files => [ db_fetch {
+			my $f : files;
+			$f->package_id == $p{package}{id};
+
+			return $f->path;
+		} ],
+	}, $pkg;
+	return $me;
+}
+
+sub name
+{
+	return $_[0]->{name};
+}
+
+sub files
+{
+	my $me = shift;
+	return @{$me->{files}};
+}
+
+package FreeBSD::Package::DB::OLD;
 use strict;
 use warnings;
 
@@ -91,7 +141,7 @@ sub next
 			$me->reset;
 			return undef;
 		}
-		my $pkg = FreeBSD::Package->new(pkgdir => $me->{packages}->[$me->{current}]);
+		my $pkg = FreeBSD::Package::OLD->new(pkgdir => $me->{packages}->[$me->{current}]);
 		return $pkg if $pkg;
 	}
 }
@@ -100,6 +150,66 @@ sub reset
 {
 	my ($me) = @_;
 	$me->{current} = -1;
+}
+
+package FreeBSD::Package::DB::PkgNg;
+use strict;
+use warnings;
+
+use DBI;  # PkgNg uses sqlite
+use DBIx::Perlish;
+
+sub new
+{
+	my ($pkg, %p) = @_;
+	my $me = bless {
+		dbh => DBI->connect("dbi:SQLite:dbname=/var/db/pkg/local.sqlite",
+			"", "", { RaiseError => 1, AutoCommit => 1 }),
+	}, $pkg;
+	my $dbh = $me->{dbh};
+	$me->{packages} = [
+		db_fetch {
+			my $p : packages;
+			return $p->id, $p->name, $p->version;
+		}
+	];
+	$me->reset;
+	return $me;
+}
+
+sub next
+{
+	my ($me) = @_;
+	while (1) {
+		$me->{current}++;
+		if ($me->{current} >= @{$me->{packages}}) {
+			$me->reset;
+			return undef;
+		}
+		my $pkg = FreeBSD::Package::PkgNg->new(dbh => $me->{dbh}, package => $me->{packages}->[$me->{current}]);
+		return $pkg if $pkg;
+	}
+}
+
+sub reset
+{
+	my ($me) = @_;
+	$me->{current} = -1;
+}
+
+package FreeBSD::Package::DB;
+use strict;
+use warnings;
+
+sub new
+{
+	my ($pkg, %p) = @_;
+	my $new_pkg_db = "/var/db/pkg/local.sqlite";
+	if (-f $new_pkg_db && -s $new_pkg_db) {
+		return FreeBSD::Package::DB::PkgNg->new(%p);
+	} else {
+		return FreeBSD::Package::DB::OLD->new(%p);
+	}
 }
 
 package FreeBSD::ELF;
@@ -405,17 +515,11 @@ sub check_package
 {
 	my ($pkg) = @_;
 	my $pkg_name = $pkg->name;
-	my $prefix = "";
 
 	main::progress();
 
 	my $ok = 1;
-	for ($pkg->lines) {
-		if (/^\@cwd\s+(\S+)\s*$/) {
-			$prefix = $1;
-			next;
-		}
-		my $file = "$prefix/$_";
+	for my $file ($pkg->files) {
 		next if -l $file;
 		# check shared libs and executables
 		if (-x $file || $file =~ /\.so\b[^\/]*$/) {
